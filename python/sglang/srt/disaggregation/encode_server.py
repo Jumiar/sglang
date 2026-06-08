@@ -222,6 +222,7 @@ class MMEncoder:
         schedule_path=None,
         dist_init_method=None,
         rank: int = 0,
+        shm_resources=None,
     ):
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
@@ -288,7 +289,9 @@ class MMEncoder:
         )
 
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
-        self.mm_cache = MultiModalStaticCache(embedding_cache_size * 1024 * 1024)
+        self.mm_cache = MultiModalStaticCache(
+            embedding_cache_size * 1024 * 1024, shm_resources=shm_resources
+        )
         self.mm_cache_lock = asyncio.Lock()
 
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
@@ -2971,6 +2974,7 @@ async def run_dp_worker(
     gpu_id: int,
     dispatch_path: str,
     result_path: str,
+    shm_resources=None,
 ):
     logger.info(
         f"DP worker {dp_rank} starting on gpu_id={gpu_id} "
@@ -2983,7 +2987,12 @@ async def run_dp_worker(
     args = copy.deepcopy(server_args)
     args.base_gpu_id = gpu_id
     args.tp_size = 1
-    enc = MMEncoder(args, dist_init_method=f"tcp://127.0.0.1:{get_free_port()}", rank=0)
+    enc = MMEncoder(
+        args,
+        dist_init_method=f"tcp://127.0.0.1:{get_free_port()}",
+        rank=0,
+        shm_resources=shm_resources,
+    )
     sched = EncoderScheduler(
         encoder=enc, send_sockets=[], max_batch_size=ENCODER_MAX_BATCH_SIZE
     )
@@ -3060,11 +3069,14 @@ def launch_dp_worker(
     gpu_id: int,
     dispatch_path: str,
     result_path: str,
+    shm_resources=None,
 ):
     try:
         configure_logger(server_args, prefix=f" encode_dp_worker[{dp_rank}]")
         asyncio.run(
-            run_dp_worker(server_args, dp_rank, gpu_id, dispatch_path, result_path)
+            run_dp_worker(
+                server_args, dp_rank, gpu_id, dispatch_path, result_path, shm_resources
+            )
         )
     except KeyboardInterrupt:
         logger.info(f"DP worker {dp_rank} exiting")
@@ -3184,6 +3196,20 @@ def _launch_server_dp(server_args: ServerArgs):
         for r in range(dp_size)
     ]
 
+    shm_resources = None
+    if (
+        server_args.enable_prefix_mm_cache
+        and os.environ.get("SGLANG_MM_CACHE_SHM", "0") == "1"
+    ):
+        mgr = ctx.Manager()
+        shm_resources = {
+            "index": mgr.dict(),
+            "lru": mgr.list(),
+            "size": mgr.Value("l", 0),
+            "lock": ctx.Lock(),
+        }
+        logger.info(f"Shared mm_cache enabled across {dp_size} DP workers")
+
     # Register atexit BEFORE spawn loop so partial spawns get reaped on
     # exception (atexit holds the list ref and reads it at exit time).
     import atexit
@@ -3215,6 +3241,7 @@ def _launch_server_dp(server_args: ServerArgs):
                     gpu_id,
                     f"ipc:///tmp/{ipc_prefix}_dp_dispatch_{dp_rank}",
                     result_path,
+                    shm_resources,
                 ),
                 daemon=False,
             )
